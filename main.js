@@ -27,7 +27,7 @@ const restartTimeout = 10000;
 
 class Traccar extends utils.Adapter {
     /**
-     * @param {Partial<utils.AdapterOptions>} [options={}]
+     * @param {Partial<utils.AdapterOptions>} [options]
      */
     constructor(options) {
         super({
@@ -73,6 +73,7 @@ class Traccar extends utils.Adapter {
 
     /**
      * Is called when adapter shuts down - callback has to be called under any circumstances!
+     *
      * @param {() => void} callback
      */
     async onUnload(callback) {
@@ -103,7 +104,7 @@ class Traccar extends utils.Adapter {
 
         if (resp && resp.headers && resp.headers['set-cookie']) {
             cookie = resp.headers['set-cookie'][0];
-            this.log.debug('Auth succses, cookie: ' + cookie);
+            this.log.debug(`Auth succses, cookie: ${  cookie}`);
         }
     }
 
@@ -411,6 +412,7 @@ class Traccar extends utils.Adapter {
     }
     /**
      * Is used to create and object and set the value
+     *
      * @param {string} objectId
      * @param {string} stateId
      * @param {string | null} stateName
@@ -471,11 +473,11 @@ class Traccar extends utils.Adapter {
     }
 }
 
-// @ts-ignore parent is a valid property on module
+
 if (module.parent) {
     // Export the constructor in compact mode
     /**
-     * @param {Partial<utils.AdapterOptions>} [options={}]
+     * @param {Partial<utils.AdapterOptions>} [options]
      */
     module.exports = (options) => new Traccar(options);
 } else {

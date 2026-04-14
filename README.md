@@ -24,6 +24,9 @@ This adapter imports in real time the position and the extended data from [Tracc
 5. Have fun :)
 
 ## Changelog
+### **WORK IN PROGRESS**
+-   (arteck) Dependencies have been updated
+
 ### 1.1.6 (2024-10-28)
 -   (arteck) dependency update
 

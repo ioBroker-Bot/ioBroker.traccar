@@ -191,14 +191,14 @@
     "connectionType": "local",
     "dataSource": "push",
     "tier": 2,
-    "dependencies": [
-      {
-        "js-controller": ">=5.0.19"
-      }
-    ],
     "globalDependencies": [
       {
-        "admin": ">=7.4.10"
+        "admin": ">=7.6.20"
+      }
+    ],
+    "dependencies": [
+      {
+        "js-controller": ">=6.0.11"
       }
     ],
     "adminUI": {
