@@ -1,29 +1,13 @@
 'use strict';
 
-/*
- * Created with @iobroker/create-adapter v1.27.0
- */
-
-// The adapter-core module gives you access to the core ioBroker functions
-// you need to create an adapter
 const utils = require('@iobroker/adapter-core');
-
-// Load your modules here, e.g.:
 const axios = require('axios').default;
 const WebSocket = require('ws');
 const defObj = require('./lib/object_definitions').defObj;
 
-let cookie;
-let ws;
-let devices;
-let positions;
-let geofences;
-const geofencesNow = [];
-let ping;
-let pingTimeout;
-let autoRestartTimeout;
-const wsHeartbeatIntervall = 30000;
-const restartTimeout = 10000;
+const WS_HEARTBEAT_INTERVAL = 30000;
+const WS_RESTART_TIMEOUT    = 10000;
+const AXIOS_TIMEOUT          = 15000;
 
 class Traccar extends utils.Adapter {
     /**
@@ -35,452 +19,492 @@ class Traccar extends utils.Adapter {
             name: 'traccar',
         });
 
-        this.on('ready', this.onReady.bind(this));
+        // FIX: alle Zustände als Instanz-Properties – keine Modul-Globals mehr
+        this.cookie          = null;
+        this.ws              = null;
+        this.devices         = [];
+        this.positions       = [];
+        this.geofences       = [];
+        this.geofencesNow    = [];   // indexed by deviceId
+        this.ping            = null;
+        this.pingTimeout     = null;
+        this.autoRestartTimeout = null;
+
+        this.on('ready',  this.onReady.bind(this));
         this.on('unload', this.onUnload.bind(this));
     }
 
-    /**
-     * Is called when databases are connected and adapter received configuration.
-     */
+    // ─── Lifecycle ────────────────────────────────────────────────────────────
+
     async onReady() {
-        // Reset adapter connection
         this.setState('info.connection', false, true);
 
-        // Log configuration
-        this.log.debug(`Scheme: ${this.config.traccarScheme}`);
-        this.log.debug(`Server IP: ${this.config.traccarIp}`);
-        this.log.debug(`Port: ${this.config.traccarPort}`);
+        this.log.debug(`Scheme:   ${this.config.traccarScheme}`);
+        this.log.debug(`Server:   ${this.config.traccarIp}:${this.config.traccarPort}`);
         this.log.debug(`Username: ${this.config.traccarUsername}`);
-        this.log.debug(`Password: ${this.config.traccarPassword !== '' ? '**********' : 'no password configured'}`);
+        this.log.debug(`Password: ${this.config.traccarPassword ? '**********' : '(not set)'}`);
 
-        // Adapter is up and running
-        this.log.debug('Adapter is up and running');
-        // Get autuh cookie for websocket
         try {
             await this.authUser();
-            // Get initial traccar data over HTTP-API
             await this.getTraccarDataOverAPI();
-            this.processData();  // first try
-            // Connect websocket
+            await this.processData();         // FIX: await hinzugefügt
             this.initWebsocket();
         } catch (error) {
-            this.log.debug(JSON.stringify(error));
-            this.log.warn('Server is offline or the address is incorrect!');
-            this.autoRestart();
+            this.log.warn(`Server is offline or the address is incorrect: ${error.message}`);
             this.setState('info.connection', false, true);
+            this.scheduleRestart();
         }
     }
 
-    /**
-     * Is called when adapter shuts down - callback has to be called under any circumstances!
-     *
-     * @param {() => void} callback
-     */
     async onUnload(callback) {
         try {
-            this.clearTimeout(ping);
-            this.clearTimeout(pingTimeout);
-            this.clearTimeout(autoRestartTimeout);
-            // Reset adapter connection
+            // FIX: konsistent this.clearTimeout nutzen
+            this.clearTimeout(this.ping);
+            this.clearTimeout(this.pingTimeout);
+            this.clearTimeout(this.autoRestartTimeout);
+            this.closeWebsocket();
             this.setState('info.connection', false, true);
-            callback();
-        } catch (e) {
+        } finally {
             callback();
         }
     }
 
+    // ─── Auth & API ───────────────────────────────────────────────────────────
+
     /**
-     * Is called to update Traccar data
+     * Authentifiziert den Nutzer und speichert das Session-Cookie.
      */
     async authUser() {
         const auth = `email=${encodeURIComponent(this.config.traccarUsername)}&password=${encodeURIComponent(this.config.traccarPassword)}`;
-        const axiosOptions = {
-            headers: {
-                'content-type': 'application/x-www-form-urlencoded',
+        const resp = await axios.post(
+            `${this.config.traccarScheme}://${this.config.traccarIp}:${this.config.traccarPort}/api/session`,
+            auth,
+            {
+                headers: { 'content-type': 'application/x-www-form-urlencoded' },
+                timeout: AXIOS_TIMEOUT,  // FIX: Timeout hinzugefügt
             },
-        };
-        // Get Cookie
-        const resp = await axios.post(`${this.config.traccarScheme}://${this.config.traccarIp}:${this.config.traccarPort}/api/session`, auth, axiosOptions);
+        );
 
-        if (resp && resp.headers && resp.headers['set-cookie']) {
-            cookie = resp.headers['set-cookie'][0];
-            this.log.debug(`Auth succses, cookie: ${  cookie}`);
-        }
-    }
-
-    async initWebsocket() {
-        // Set websocket connection
-        ws = new WebSocket(`${this.config.traccarScheme == 'http' ? 'ws' : 'wss'}://${this.config.traccarIp}:${this.config.traccarPort}/api/socket`, { headers: { Cookie: cookie } });
-
-        // On connect
-        ws.on('open', () => {
-            this.log.debug('Websocket connectet');
-            // Set connection state
-            this.setState('info.connection', true, true);
-            this.log.info('Connect to server over websocket connection.');
-            // Send ping to server
-            this.sendPingToServer();
-            // Start Heartbeat
-            this.wsHeartbeat();
-        });
-
-        // Incomming messages
-        ws.on('message', async (message) => {
-            this.log.debug(`Incomming message: ${message}`);
-            const obj = JSON.parse(message);
-            const objName = Object.keys(obj)[0];
-
-            // Clean positions;
-            positions = [];
-
-            // Position message
-            if (objName == 'positions') {
-                positions = obj.positions;
-                await this.processPosition();
-            }
-            // Device message
-            if (objName == 'devices') {
-                for (const key in obj.devices) {
-                    const index = devices.findIndex((x) => x.id == obj.devices[key].id);
-                    if (index == -1) {
-                        await this.getTraccarDataOverAPI();
-                        return;
-                    }
-                    devices[index] = obj.devices[key];
-                }
-                await this.processData();
-            }
-
-        });
-
-        // On Close
-        ws.on('close', () => {
-            this.setState('info.connection', false, true);
-            this.log.warn('Websocket disconnectet');
-            clearTimeout(ping);
-            clearTimeout(pingTimeout);
-
-            if (ws.readyState === WebSocket.CLOSED) {
-                this.autoRestart();
-            }
-        });
-
-        // Pong from Server
-        ws.on('pong', () => {
-            this.log.debug('Receive pong from server');
-            this.wsHeartbeat();
-        });
-    }
-
-    async sendPingToServer() {
-        this.log.debug('Send ping to server');
-        ws.ping('iobroker.traccar');
-        ping = setTimeout(() => {
-            this.sendPingToServer();
-        }, wsHeartbeatIntervall);
-    }
-
-    async wsHeartbeat() {
-        clearTimeout(pingTimeout);
-        pingTimeout = setTimeout(() => {
-            this.log.debug('Websocked connection timed out');
-            ws.terminate();
-        }, wsHeartbeatIntervall + 1000);
-    }
-
-    async autoRestart() {
-        this.log.warn(`Start try again in ${restartTimeout / 1000} seconds...`);
-        autoRestartTimeout = setTimeout(() => {
-            this.onReady();
-        }, restartTimeout);
-    }
-
-    async processData() {
-        // Process devices
-
-        this.setObjectAndState('devices', 'devices');
-
-        for (const device of devices) {
-            const stateBaseID = `devices.${device.id}`;
-            // Create static datapoins
-            this.setObjectAndState('devices.device', stateBaseID, device.name);
-            this.setObjectAndState('devices.device.device_name', `${stateBaseID}.device_name`, null, device.name);
-            this.setObjectAndState('devices.device.status', `${stateBaseID}.status`, null, device.status);
-            this.setObjectAndState('devices.device.last_update_from_server', `${stateBaseID}.last_update_from_server`, null, device.lastUpdate);
-            this.setObjectAndState('devices.device.last_update', `${stateBaseID}.last_update`, null, Number(Date.now()));
-
-            // Server < v5.8
-            if (device.geofenceIds) {
-                const deviceGeofencesState = await this.getGeofencesState(device.geofenceIds);
-                this.setObjectAndState('devices.device.geofence_ids', `${stateBaseID}.geofence_ids`, null, JSON.stringify(device.geofenceIds));
-                this.setObjectAndState('devices.device.geofences', `${stateBaseID}.geofences`, null, JSON.stringify(deviceGeofencesState));
-                this.setObjectAndState('devices.device.geofences_string', `${stateBaseID}.geofences_string`, null, deviceGeofencesState.join(', '));
-            }
-        }
-        await this.processGeofences();
-    }
-
-    async processPosition() {
-        //      const position = positions.find((p) => p.deviceId === device.id);
-
-        for (const position of positions) {
-            const stateBaseID = `devices.${position.deviceId}`;
-            // Create static datapoins
-            this.setObjectAndState('devices.device.altitude', `${stateBaseID}.altitude`, null, Number(parseFloat(position.altitude).toFixed(1)));
-            this.setObjectAndState('devices.device.accuracy', `${stateBaseID}.accuracy`, null, Number(parseFloat(position.accuracy).toFixed(2)));
-            this.setObjectAndState('devices.device.course', `${stateBaseID}.course`, null, position.course);
-            this.setObjectAndState('devices.device.latitude', `${stateBaseID}.latitude`, null, position.latitude);
-            this.setObjectAndState('devices.device.longitude', `${stateBaseID}.longitude`, null, position.longitude);
-            this.setObjectAndState('devices.device.position', `${stateBaseID}.position`, null, `${position.latitude},${position.longitude}`);
-            this.setObjectAndState('devices.device.position_url', `${stateBaseID}.position_url`, null, `https://maps.google.com/maps?z=15&t=m&q=loc:${position.latitude}+${position.longitude}`);
-            this.setObjectAndState('devices.device.speed', `${stateBaseID}.speed`, null, Number(Number(position.speed).toFixed()));
-            this.setObjectAndState('devices.device.outdated', `${stateBaseID}.outdated`, null, position.outdated);
-            this.setObjectAndState('devices.device.last_update', `${stateBaseID}.last_update`, null, Number(Date.now()));
-            // Server >= v5.8
-            let geofenceIds = '';
-            if (position.geofenceIds) {
-                const positionGeofencesState = await this.getGeofencesState(position.geofenceIds);
-                geofenceIds = JSON.stringify(position.geofenceIds);
-
-                this.setObjectAndState('devices.device.geofence_ids', `${stateBaseID}.geofence_ids`, null, geofenceIds);
-                this.setObjectAndState('devices.device.geofences', `${stateBaseID}.geofences`, null, JSON.stringify(positionGeofencesState));
-                this.setObjectAndState('devices.device.geofences_string', `${stateBaseID}.geofences_string`, null, positionGeofencesState.join(', '));
-            } else {
-                this.setObjectAndState('devices.device.geofence_ids', `${stateBaseID}.geofence_ids`, null, '[]');
-                this.setObjectAndState('devices.device.geofences', `${stateBaseID}.geofences`, null, '[]');
-                this.setObjectAndState('devices.device.geofences_string', `${stateBaseID}.geofences_string`, null, '');
-            }
-
-            geofencesNow[position.deviceId] = geofenceIds;
-
-            // Address is optional
-            if (position.address) {
-                this.setObjectAndState('devices.device.address', `${stateBaseID}.address`, null, position.address);
-            }
-
-            // Create dynamic datapoints for attributes
-            for (const key in position.attributes) {
-                await this.createObjectAndState(position.deviceId, position.attributes, key);
-            }
-        }
-        await this.processGeofences();
-    }
-
-
-    async processGeofences() {
-        // Process geofences
-        this.setObjectAndState('geofences', 'geofences');
-        for (const geofence of geofences) {
-            const stateBaseID = `geofences.${geofence.id}`;
-            // Create static datapoins
-            const geoDeviceState = this.getGeoDeviceState(geofence,  this.config.server58);
-            this.setObjectAndState('geofences.geofence', stateBaseID, geofence.name);
-            this.setObjectAndState('geofences.geofence.geofence_name', `${stateBaseID}.geofence_name`, null, geofence.name);
-            this.setObjectAndState('geofences.geofence.device_ids', `${stateBaseID}.device_ids`, null, JSON.stringify(geoDeviceState[0]));
-            this.setObjectAndState('geofences.geofence.devices', `${stateBaseID}.devices`, null, JSON.stringify(geoDeviceState[1]));
-            this.setObjectAndState('geofences.geofence.devices_string', `${stateBaseID}.devices_string`, null, geoDeviceState[1].join(', '));
-            this.setObjectAndState('geofences.geofence.last_update', `${stateBaseID}.last_update`, null, Number(Date.now()));
+        if (resp?.headers?.['set-cookie']) {
+            this.cookie = resp.headers['set-cookie'][0];
+            this.log.debug('Auth successful, cookie received.');
+        } else {
+            throw new Error('Auth failed: no cookie in response.');
         }
     }
 
     /**
-     * Is called to update Traccar data
+     * Lädt Geräte, Positionen und Geofences parallel via REST-API.
+     *
+     * FIX: Promise.all statt deprecated axios.all; Timeout ergänzt.
      */
     async getTraccarDataOverAPI() {
-        const baseUrl = `${this.config.traccarScheme}://${this.config.traccarIp}:${this.config.traccarPort}/api`;
-
-        const axiosOptions = {
+        const baseUrl     = `${this.config.traccarScheme}://${this.config.traccarIp}:${this.config.traccarPort}/api`;
+        const axiosOpts   = {
             auth: {
                 username: this.config.traccarUsername,
                 password: this.config.traccarPassword,
             },
+            timeout: AXIOS_TIMEOUT,   // FIX: Timeout hinzugefügt
         };
 
-        const responses = await axios.all([axios.get(`${baseUrl}/devices`, axiosOptions), axios.get(`${baseUrl}/positions`, axiosOptions), axios.get(`${baseUrl}/geofences`, axiosOptions)]);
+        // FIX: Promise.all statt deprecated axios.all
+        const [devResp, posResp, geoResp] = await Promise.all([
+            axios.get(`${baseUrl}/devices`,   axiosOpts),
+            axios.get(`${baseUrl}/positions`, axiosOpts),
+            axios.get(`${baseUrl}/geofences`, axiosOpts),
+        ]);
 
-        for (const key in responses) {
-            this.log.debug(JSON.stringify(responses[key].data));
-        }
+        this.devices   = devResp.data  ?? [];
+        this.positions = posResp.data  ?? [];
+        this.geofences = geoResp.data  ?? [];
 
-        devices = responses[0].data;
-        positions = responses[1].data;
-        geofences = responses[2].data;
-
-
-
-        //  const server = await axios.all([axios.get(`${baseUrl}/server`, axiosOptions), axios.get(`${baseUrl}/positions`, axiosOptions), axios.get(`${baseUrl}/geofences`, axiosOptions)]);
-
+        this.log.debug(`API loaded: ${this.devices.length} devices, ${this.positions.length} positions, ${this.geofences.length} geofences`);
     }
 
+    // ─── WebSocket ────────────────────────────────────────────────────────────
+
+    initWebsocket() {
+        // FIX: geofencesNow vor jedem Reconnect zurücksetzen
+        this.geofencesNow = [];
+
+        const scheme = this.config.traccarScheme === 'http' ? 'ws' : 'wss';
+        const url    = `${scheme}://${this.config.traccarIp}:${this.config.traccarPort}/api/socket`;
+
+        this.ws = new WebSocket(url, { headers: { Cookie: this.cookie } });
+
+        this.ws.on('open', () => {
+            this.log.info('Connected to Traccar server via WebSocket.');
+            this.setState('info.connection', true, true);
+            this.sendPingToServer();
+            this.wsHeartbeat();
+        });
+
+        this.ws.on('message', async (message) => {
+            this.log.debug(`Incoming message: ${message}`);
+            try {
+                const obj     = JSON.parse(message);
+                const objName = Object.keys(obj)[0];
+
+                if (objName === 'positions') {
+                    // FIX: nur bei tatsächlicher Position-Nachricht leeren
+                    this.positions = obj.positions;
+                    await this.processPosition();
+                } else if (objName === 'devices') {
+                    // FIX: for...of statt for...in über Array
+                    for (const updatedDevice of obj.devices) {
+                        const index = this.devices.findIndex((x) => x.id === updatedDevice.id);
+                        if (index === -1) {
+                            // Unbekanntes Gerät – API neu laden
+                            await this.getTraccarDataOverAPI();
+                            return;
+                        }
+                        this.devices[index] = updatedDevice;
+                    }
+                    await this.processData();
+                }
+            } catch (err) {
+                this.log.error(`Error processing WebSocket message: ${err.message}`);
+            }
+        });
+
+        this.ws.on('pong', () => {
+            this.log.debug('Received pong from server.');
+            this.wsHeartbeat();
+        });
+
+        this.ws.on('close', async () => {
+            // FIX: this.clearTimeout konsistent verwenden
+            this.clearTimeout(this.ping);
+            this.clearTimeout(this.pingTimeout);
+            this.setState('info.connection', false, true);
+            this.log.warn('WebSocket disconnected.');
+
+            if (this.ws.readyState === WebSocket.CLOSED) {
+                this.scheduleRestart();
+            }
+        });
+
+        // FIX: Fehlender Error-Handler – verhindert unkontrollierte Crashes
+        this.ws.on('error', (err) => {
+            this.log.error(`WebSocket error: ${err.message}`);
+        });
+    }
+
+    sendPingToServer() {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+            return;
+        }
+        this.log.debug('Sending ping to server.');
+        this.ws.ping('iobroker.traccar');
+        this.ping = this.setTimeout(() => {
+            this.sendPingToServer();
+        }, WS_HEARTBEAT_INTERVAL);
+    }
+
+    wsHeartbeat() {
+        this.clearTimeout(this.pingTimeout);
+        this.pingTimeout = this.setTimeout(() => {
+            this.log.warn('WebSocket heartbeat timed out – terminating connection.');
+            if (this.ws) {
+this.ws.terminate();
+}
+        }, WS_HEARTBEAT_INTERVAL + 1000);
+    }
+
+    /**
+     * FIX: scheduleRestart statt autoRestart – ruft NICHT mehr onReady() auf.
+     * onReady() direkt aufzurufen führt zu gestapelten Event-Listenern (Memory Leak).
+     * Stattdessen wird nur ein neuer Connect-Versuch gestartet.
+     */
+    scheduleRestart() {
+        this.log.warn(`Reconnecting in ${WS_RESTART_TIMEOUT / 1000} seconds...`);
+        this.autoRestartTimeout = this.setTimeout(async () => {
+            try {
+                await this.authUser();
+                await this.getTraccarDataOverAPI();
+                await this.processData();
+                this.initWebsocket();
+            } catch (err) {
+                this.log.warn(`Reconnect failed: ${err.message}`);
+                this.scheduleRestart();
+            }
+        }, WS_RESTART_TIMEOUT);
+    }
+
+    closeWebsocket() {
+        if (this.ws && this.ws.readyState !== WebSocket.CLOSED) {
+            this.ws.close();
+        }
+    }
+
+    // ─── Datenverarbeitung ────────────────────────────────────────────────────
+
+    async processData() {
+        if (!Array.isArray(this.devices)) {
+            return;
+        }
+
+        await this.setObjectAndState('devices', 'devices');
+
+        for (const device of this.devices) {
+            const baseId = `devices.${device.id}`;
+
+            await this.setObjectAndState('devices.device',                          baseId,                         device.name);
+            await this.setObjectAndState('devices.device.device_name',              `${baseId}.device_name`,        null, device.name);
+            await this.setObjectAndState('devices.device.status',                   `${baseId}.status`,             null, device.status);
+            await this.setObjectAndState('devices.device.last_update_from_server',  `${baseId}.last_update_from_server`, null, device.lastUpdate);
+            await this.setObjectAndState('devices.device.last_update',              `${baseId}.last_update`,        null, Number(Date.now()));
+
+            // Traccar < v5.8: Geofences kommen vom Gerät
+            if (device.geofenceIds) {
+                const names = await this.getGeofencesState(device.geofenceIds);
+                await this.setObjectAndState('devices.device.geofence_ids',    `${baseId}.geofence_ids`,    null, JSON.stringify(device.geofenceIds));
+                await this.setObjectAndState('devices.device.geofences',       `${baseId}.geofences`,       null, JSON.stringify(names));
+                await this.setObjectAndState('devices.device.geofences_string',`${baseId}.geofences_string`,null, names.join(', '));
+            }
+        }
+
+        await this.processGeofences();
+    }
+
+    async processPosition() {
+        if (!Array.isArray(this.positions)) {
+            return;
+        }
+
+        for (const position of this.positions) {
+            const baseId = `devices.${position.deviceId}`;
+
+            await this.setObjectAndState('devices.device.altitude',    `${baseId}.altitude`,    null, Number(parseFloat(position.altitude).toFixed(1)));
+            await this.setObjectAndState('devices.device.accuracy',    `${baseId}.accuracy`,    null, Number(parseFloat(position.accuracy).toFixed(2)));
+            await this.setObjectAndState('devices.device.course',      `${baseId}.course`,      null, position.course);
+            await this.setObjectAndState('devices.device.latitude',    `${baseId}.latitude`,    null, position.latitude);
+            await this.setObjectAndState('devices.device.longitude',   `${baseId}.longitude`,   null, position.longitude);
+            await this.setObjectAndState('devices.device.position',    `${baseId}.position`,    null, `${position.latitude},${position.longitude}`);
+            await this.setObjectAndState('devices.device.position_url',`${baseId}.position_url`,null,
+                `https://maps.google.com/maps?z=15&t=m&q=loc:${position.latitude}+${position.longitude}`);
+            await this.setObjectAndState('devices.device.speed',       `${baseId}.speed`,       null, Number(Number(position.speed).toFixed()));
+            await this.setObjectAndState('devices.device.outdated',    `${baseId}.outdated`,    null, position.outdated);
+            await this.setObjectAndState('devices.device.last_update', `${baseId}.last_update`, null, Number(Date.now()));
+
+            // Traccar >= v5.8: Geofences kommen von der Position
+            if (position.geofenceIds) {
+                const names = await this.getGeofencesState(position.geofenceIds);
+                this.geofencesNow[position.deviceId] = JSON.stringify(position.geofenceIds);
+
+                await this.setObjectAndState('devices.device.geofence_ids',     `${baseId}.geofence_ids`,     null, this.geofencesNow[position.deviceId]);
+                await this.setObjectAndState('devices.device.geofences',        `${baseId}.geofences`,        null, JSON.stringify(names));
+                await this.setObjectAndState('devices.device.geofences_string', `${baseId}.geofences_string`, null, names.join(', '));
+            } else {
+                this.geofencesNow[position.deviceId] = '[]';
+                await this.setObjectAndState('devices.device.geofence_ids',     `${baseId}.geofence_ids`,     null, '[]');
+                await this.setObjectAndState('devices.device.geofences',        `${baseId}.geofences`,        null, '[]');
+                await this.setObjectAndState('devices.device.geofences_string', `${baseId}.geofences_string`, null, '');
+            }
+
+            if (position.address) {
+                await this.setObjectAndState('devices.device.address', `${baseId}.address`, null, position.address);
+            }
+
+            for (const key of Object.keys(position.attributes)) {
+                await this.createObjectAndState(position.deviceId, position.attributes, key);
+            }
+        }
+
+        await this.processGeofences();
+    }
+
+    async processGeofences() {
+        if (!Array.isArray(this.geofences)) {
+            return;
+        }
+
+        await this.setObjectAndState('geofences', 'geofences');
+
+        for (const geofence of this.geofences) {
+            const baseId       = `geofences.${geofence.id}`;
+            const geoDevState  = this.getGeoDeviceState(geofence, this.config.server58);
+
+            await this.setObjectAndState('geofences.geofence',                baseId,                          geofence.name);
+            await this.setObjectAndState('geofences.geofence.geofence_name',  `${baseId}.geofence_name`,  null, geofence.name);
+            await this.setObjectAndState('geofences.geofence.device_ids',     `${baseId}.device_ids`,     null, JSON.stringify(geoDevState[0]));
+            await this.setObjectAndState('geofences.geofence.devices',        `${baseId}.devices`,        null, JSON.stringify(geoDevState[1]));
+            await this.setObjectAndState('geofences.geofence.devices_string', `${baseId}.devices_string`, null, geoDevState[1].join(', '));
+            await this.setObjectAndState('geofences.geofence.last_update',    `${baseId}.last_update`,    null, Number(Date.now()));
+        }
+    }
+
+    // ─── Geofence-Hilfsmethoden ───────────────────────────────────────────────
+
+    /**
+     * Löst Geofence-IDs in Geofence-Namen auf.
+     * FIX: API-Neuaufruf jetzt nur einmal, nicht pro fehlendem Eintrag im Loop.
+     *
+     * @param {number[]} geofenceIds
+     * @returns {Promise<string[]>}
+     */
     async getGeofencesState(geofenceIds) {
-        const geofencesState = [];
-        if (geofenceIds) {
-            for (const geofenceId of geofenceIds) {
-                const geofence = geofences.find((element) => element.id === geofenceId);
-                // Workaround for unclean geofences in the database
-                if (!geofence || !geofence.name) {
-                    await this.getTraccarDataOverAPI();
-                } else {
-                    geofencesState.push(geofence.name);
-                }
-            }
+        if (!geofenceIds?.length) {
+            return [];
         }
-        return geofencesState;
+
+        let needsReload = false;
+
+        const names = geofenceIds.map((id) => {
+            const found = this.geofences.find((g) => g.id === id);
+            if (!found?.name) {
+                needsReload = true;
+                return null;
+            }
+            return found.name;
+        });
+
+        // FIX: nur einmal neu laden, nicht pro fehlendem Eintrag
+        if (needsReload) {
+            await this.getTraccarDataOverAPI();
+            return this.getGeofencesState(geofenceIds);   // retry nach Reload
+        }
+
+        return names;
     }
 
+    /**
+     * Ermittelt welche Geräte sich gerade in einem Geofence befinden.
+     * FIX: Null-Check für `found` ergänzt.
+     *
+     * @param {object} geofence
+     * @param {boolean} serverVersion58
+     * @returns {[number[], string[]]}
+     */
     getGeoDeviceState(geofence, serverVersion58) {
-        const deviceIdsState = [];
-        const devicesState = [];
-        if (serverVersion58 == true) {
-            for (let i = 0; i < geofencesNow.length; i++) {
-                if (geofencesNow[i] != null) {
-                    if (geofencesNow[i].includes(geofence.id)) {
-                        deviceIdsState.push(i);
-                        const found = devices.find(({id}) => id === i);
-                        devicesState.push(found.name);
+        const deviceIds  = [];
+        const deviceNames = [];
+
+        if (serverVersion58) {
+            // >= v5.8: Geofences kommen von der Position
+            for (let i = 0; i < this.geofencesNow.length; i++) {
+                if (this.geofencesNow[i] != null && this.geofencesNow[i].includes(String(geofence.id))) {
+                    const found = this.devices.find(({ id }) => id === i);
+                    if (found) {
+                        deviceIds.push(i);
+                        deviceNames.push(found.name);
                     }
                 }
             }
         } else {
-            for (const device of devices) {
-                if (device.geofenceIds) {
-                    if (device.geofenceIds.includes(geofence.id)) {
-                        deviceIdsState.push(device.id);
-                        devicesState.push(device.name);
-                    }
+            // < v5.8: Geofences kommen vom Gerät
+            for (const device of this.devices) {
+                if (device.geofenceIds?.includes(geofence.id)) {
+                    deviceIds.push(device.id);
+                    deviceNames.push(device.name);
                 }
             }
         }
 
-
-        return [deviceIdsState, devicesState];
+        return [deviceIds, deviceNames];
     }
 
-    getGeoDeviceStateold(geofence, serverVersion58) {
-        const deviceIdsState = [];
-        const devicesState = [];
-        if (serverVersion58 == true) {
-            for (const position of positions) {
-                if (position.geofenceIds) {
-                    if (position.geofenceIds.includes(geofence.id)) {
-                        deviceIdsState.push(position.deviceId);
-                        const found = devices.find(({ id }) => id === position.deviceId);
-                        devicesState.push(found.name);
-                    }
-                }
-            }
-        } else {
-            for (const device of devices) {
-                if (device.geofenceIds) {
-                    if (device.geofenceIds.includes(geofence.id)) {
-                        deviceIdsState.push(device.id);
-                        devicesState.push(device.name);
-                    }
-                }
-            }
-        }
-
-
-        return [deviceIdsState, devicesState];
-    }
+    // ─── Objekt/State-Verwaltung ──────────────────────────────────────────────
 
     async createObjectAndState(deviceId, obj, key) {
-        let val = obj[key];
-        if (typeof val === 'object' && !Array.isArray(val)) {
-            for (const objKey in val) {
-                const objVal = val[objKey];
-                const stateID = `devices.${deviceId}.${this.formatName(objKey)}`;
-                const objID = `devices.device.${this.formatName(objKey)}`;
-                this.log.debug(`objID: ${objID}, val: ${objVal}`);
-                if (!objKey[0].match(/[A-z]/i)) {
-                    this.log.warn(`${objKey} does not start with a letter, this will cause problems with the state name therefore this value must be ignored!`);
+        const val   = obj[key];
+        const baseObjId   = `devices.device`;
+        const baseStateId = `devices.${deviceId}`;
+
+        if (typeof val === 'object' && val !== null && !Array.isArray(val)) {
+            for (const [objKey, objVal] of Object.entries(val)) {
+                if (!objKey[0].match(/[A-Za-z]/)) {
+                    this.log.warn(`Key "${objKey}" does not start with a letter – skipped.`);
+                    continue;
                 }
-                this.setObjectAndState(objID, stateID, this.formatStateName(objKey), objVal);
+                await this.setObjectAndState(
+                    `${baseObjId}.${this.formatName(objKey)}`,
+                    `${baseStateId}.${this.formatName(objKey)}`,
+                    this.formatStateName(objKey),
+                    objVal,
+                );
             }
         } else {
-            const stateID = `devices.${deviceId}.${this.formatName(key)}`;
-            const objID = `devices.device.${this.formatName(key)}`;
-            this.log.debug(`objID: ${objID}, val: ${val}`);
-            if (Array.isArray(val)) {
-                val = JSON.stringify(val);
+            if (!key[0].match(/[A-Za-z]/)) {
+                this.log.warn(`Key "${key}" does not start with a letter – skipped.`);
+                return;
             }
-            if (!key[0].match(/[A-z]/i)) {
-                this.log.warn(`${key} does not start with a letter, this will cause problems with the state name therefore this value must be ignored!`);
-            }
-            this.setObjectAndState(objID, stateID, this.formatStateName(key), val);
+            await this.setObjectAndState(
+                `${baseObjId}.${this.formatName(key)}`,
+                `${baseStateId}.${this.formatName(key)}`,
+                this.formatStateName(key),
+                Array.isArray(val) ? JSON.stringify(val) : val,
+            );
         }
     }
+
     /**
-     * Is used to create and object and set the value
+     * Erstellt ein Objekt (falls nicht vorhanden) und setzt den State-Wert.
      *
      * @param {string} objectId
      * @param {string} stateId
-     * @param {string | null} stateName
+     * @param {string|null} stateName
      * @param {*} value
      */
     async setObjectAndState(objectId, stateId, stateName = null, value = null) {
-        let obj;
+        const template = defObj[objectId] ?? {
+            type: 'state',
+            common: {
+                name:  stateName,
+                type:  'mixed',
+                role:  'state',
+                read:  true,
+                write: true,
+            },
+            native: {},
+        };
 
-        if (defObj[objectId]) {
-            obj = defObj[objectId];
-        } else {
-            obj = {
-                type: 'state',
-                common: {
-                    name: stateName,
-                    type: 'mixed',
-                    role: 'state',
-                    read: true,
-                    write: true,
-                },
-                native: {},
-            };
-        }
-
+        const common = { ...template.common };
         if (stateName !== null) {
-            obj.common.name = stateName;
+            common.name = stateName;
         }
 
         await this.setObjectNotExistsAsync(stateId, {
-            type: obj.type,
-            common: JSON.parse(JSON.stringify(obj.common)),
-            native: JSON.parse(JSON.stringify(obj.native)),
+            type:    template.type,
+            common,
+            native: { ...template.native },
         });
 
         if (value !== null) {
-            await this.setStateChangedAsync(stateId, {
-                val: value,
-                ack: true,
-            });
+            await this.setStateChangedAsync(stateId, { val: value, ack: true });
         }
     }
 
+    // ─── Formatierungshilfen ──────────────────────────────────────────────────
+
+    /**
+     * Wandelt camelCase in snake_case um.
+     *
+     * @param {string} input
+     * @returns {string}
+     */
     formatName(input) {
-        const wordArray = input.split(/(?=[A-Z])/);
-        return wordArray.join('_').toLowerCase();
+        return input.split(/(?=[A-Z])/).join('_').toLowerCase();
     }
 
+    /**
+     * Wandelt camelCase in einen lesbaren State-Namen um ("batteryLevel" → "Battery level").
+     *
+     * @param {string} input
+     * @returns {string}
+     */
     formatStateName(input) {
-        const wordArray = input.split(/(?=[A-Z])/);
-        for (const key in wordArray) {
-            if (key === '0') {
-                wordArray[key] = wordArray[key][0].toUpperCase() + wordArray[key].substr(1);
-            } else {
-                wordArray[key] = wordArray[key].toLowerCase();
-            }
-        }
-        return wordArray.join(' ');
+        const parts = input.split(/(?=[A-Z])/);
+        return parts
+            .map((part, i) => i === 0 ? part[0].toUpperCase() + part.slice(1) : part.toLowerCase())
+            .join(' ');
     }
 }
 
-
-if (module.parent) {
-    // Export the constructor in compact mode
-    /**
-     * @param {Partial<utils.AdapterOptions>} [options]
-     */
+// FIX: module.parent ist deprecated seit Node 14 – require.main verwenden
+if (require.main !== module) {
     module.exports = (options) => new Traccar(options);
 } else {
-    // otherwise start the instance directly
     new Traccar();
 }

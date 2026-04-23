@@ -1,8 +1,21 @@
 {
   "common": {
     "name": "traccar",
-    "version": "1.1.7",
+    "version": "1.2.0",
     "news": {
+      "1.2.0": {
+        "en": "refactoring",
+        "de": "refaktor",
+        "ru": "рефакторинг",
+        "pt": "refatorização",
+        "nl": "refactoring",
+        "fr": "refactoration",
+        "it": "refactoring",
+        "es": "refactoring",
+        "pl": "refaktoring",
+        "uk": "рефакторинг",
+        "zh-cn": "正在重构"
+      },
       "1.1.7": {
         "en": "dependency update",
         "de": "aktualisierung der abhängigkeit",
@@ -80,32 +93,6 @@
         "pl": "innym rozwiązaniem dla usług Traccar Server >==== v5,8",
         "uk": "ще одна фіксація для Traccar Server >= в5.8",
         "zh-cn": "追踪服务者的另一个缺陷 第5.8条"
-      },
-      "1.1.1": {
-        "en": "fix translation",
-        "de": "bersetzung",
-        "ru": "исправить перевод",
-        "pt": "corrigir a tradução",
-        "nl": "vertaling:",
-        "fr": "traduction correcte",
-        "it": "correzione della traduzione",
-        "es": "traducción",
-        "pl": "poprawić",
-        "uk": "фіксувати переклад",
-        "zh-cn": "fix 翻译"
-      },
-      "1.1.0": {
-        "en": "support for https/wss connections\nfix for Traccar Server < v5.8",
-        "de": "unterstützung von https/wss-verbindungen\nfix für Traccar Server < v5.8",
-        "ru": "поддержка https/wss соединений\nисправить для Traccar Server < v5.8",
-        "pt": "suporte para conexões https/wss\ncorreção para Traccar Server < v5.8",
-        "nl": "_\nvertaling:",
-        "fr": "support pour les connexions https/wss\nfix pour Traccar Server  v5.8",
-        "it": "supporto per connessioni https/wss\ncorretto per Traccar Server < v5.8",
-        "es": "soporte para conexiones https/wss\nfijado para Traccar Server",
-        "pl": "obsługa połączeń https/ws\nrezultatem dla Traccar Server < v5.8",
-        "uk": "підтримка підключення https/ws\nвиправити для Traccar Server < v5.8",
-        "zh-cn": "支持网站/网络\nfix 托儿服务(< v5.8>)"
       }
     },
     "titleLang": {
